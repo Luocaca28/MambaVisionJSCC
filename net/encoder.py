@@ -1,37 +1,11 @@
 import torch
 import torch.nn as nn
 
-from net.modules import PatchEmbed, PatchMerging, trunc_normal_, MambaEncoderLayer
-
-
-class AdaptiveModulator(nn.Module):
-    """Reimplementation of the SwinJSCC AdaptiveModulator."""
-
-    def __init__(self, M: int):
-        super(AdaptiveModulator, self).__init__()
-        self.fc = nn.Sequential(
-            nn.Linear(1, M),
-            nn.ReLU(),
-            nn.Linear(M, M),
-            nn.ReLU(),
-            nn.Linear(M, M),
-            nn.Sigmoid(),
-        )
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.fc(x)
+from net.modules import MambaEncoderLayer, PatchEmbed, PatchMerging, trunc_normal_
 
 
 class MambaJSCC_Encoder(nn.Module):
-    """
-    MambaVision-based encoder for JSCC.
-
-    接口基本仿照 SwinJSCC_Encoder：
-      - 输入: (B, 3, H, W)
-      - 输出:
-          * 无 RA: feature (B, L, C)
-          * 有 RA: (feature, mask)，其中 mask (B, L, C)
-    """
+    """Hierarchical MambaVision encoder for JSCC."""
 
     def __init__(
         self,
@@ -78,10 +52,6 @@ class MambaJSCC_Encoder(nn.Module):
 
         self.patch_embed = PatchEmbed(img_size, patch_size, in_chans, embed_dims[0])
 
-        self.hidden_dim = int(self.embed_dims[-1] * 1.5)
-        self.layer_num = layer_num = 7
-
-        # hierarchical MambaVision encoder stages
         if layer_scale_conv is None:
             layer_scale_conv = layer_scale
 
@@ -98,11 +68,6 @@ class MambaJSCC_Encoder(nn.Module):
 
         self.layers = nn.ModuleList()
         for i_layer in range(self.num_layers):
-            # PatchEmbed downsamples by `patch_size`, then each stage (except stage 0) downsamples by 2 via PatchMerging.
-            # In this implementation, PatchMerging is applied at the *start* of stage i_layer>=1, so:
-            #   - stage0 operates at patches_resolution (H/patch, W/patch)
-            #   - stage1 downsamples to patches_resolution/2
-            #   - stage2 downsamples to patches_resolution/4, ...
             if i_layer <= 1:
                 input_resolution = self.patches_resolution
             else:
@@ -139,107 +104,15 @@ class MambaJSCC_Encoder(nn.Module):
             self.layers.append(layer)
 
         self.norm = norm_layer(embed_dims[-1])
-        if C is not None:
-            self.head_list = nn.Linear(embed_dims[-1], C)
-
+        self.head_list = nn.Linear(embed_dims[-1], C)
         self.apply(self._init_weights)
 
-        # SA / RA 调制模块
-        self.bm_list = nn.ModuleList()
-        self.sm_list = nn.ModuleList()
-        self.sm_list.append(nn.Linear(self.embed_dims[-1], self.hidden_dim))
-        for i in range(layer_num):
-            if i == layer_num - 1:
-                outdim = self.embed_dims[-1]
-            else:
-                outdim = self.hidden_dim
-            self.bm_list.append(AdaptiveModulator(self.hidden_dim))
-            self.sm_list.append(nn.Linear(self.hidden_dim, outdim))
-        self.sigmoid = nn.Sigmoid()
-
-        # SNR+Rate 组合调制
-        # (RA removed) no rate-aware modulation branch.
-
-    def _load_from_state_dict(
-        self,
-        state_dict,
-        prefix,
-        local_metadata,
-        strict,
-        missing_keys,
-        unexpected_keys,
-        error_msgs,
-    ):
-        # Backward-compat: older checkpoints used *_list1 naming for the SA branch.
-        legacy_map = (
-            ("bm_list1.", "bm_list."),
-            ("sm_list1.", "sm_list."),
-            ("sigmoid1.", "sigmoid."),
-            ("sigmoid1", "sigmoid"),
-        )
-        for k in list(state_dict.keys()):
-            if not str(k).startswith(prefix):
-                continue
-            rel = str(k)[len(prefix) :]
-            new_rel = None
-            for old, new in legacy_map:
-                if rel.startswith(old):
-                    new_rel = new + rel[len(old) :]
-                    break
-                if rel == old:
-                    new_rel = new
-                    break
-            if new_rel is None:
-                continue
-            new_key = prefix + new_rel
-            if new_key not in state_dict:
-                state_dict[new_key] = state_dict[k]
-            del state_dict[k]
-
-        super()._load_from_state_dict(
-            state_dict,
-            prefix,
-            local_metadata,
-            strict,
-            missing_keys,
-            unexpected_keys,
-            error_msgs,
-        )
-
-    def forward(self, x, snr, rate, model):
-        B, C, H, W = x.size()
-        device = x.device
-
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = self.patch_embed(x)
         for layer in self.layers:
             x = layer(x)
         x = self.norm(x)
-
-        if model == "MambaVisionJSCC_w/o_SAandRA":
-            x = self.head_list(x)
-            return x
-
-        elif model == "MambaVisionJSCC_w/_SA":
-            snr_cuda = torch.tensor(snr, dtype=torch.float, device=device)
-            snr_batch = snr_cuda.unsqueeze(0).expand(B, -1)
-            for i in range(self.layer_num):
-                if i == 0:
-                    temp = self.sm_list[i](x.detach())
-                else:
-                    temp = self.sm_list[i](temp)
-
-                bm = (
-                    self.bm_list[i](snr_batch)
-                    .unsqueeze(1)
-                    .expand(-1, x.size(1), -1)
-                )
-                temp = temp * bm
-            mod_val = self.sigmoid(self.sm_list[-1](temp))
-            x = x * mod_val
-            x = self.head_list(x)
-            return x
-
-        raise ValueError(f"Unsupported model variant (RA removed): {model}")
+        return self.head_list(x)
 
     def _init_weights(self, m):
         if isinstance(m, nn.Linear):

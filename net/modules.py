@@ -1,4 +1,5 @@
 import math
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -22,8 +23,6 @@ except Exception as e:  # pragma: no cover
 
 
 class Mlp(nn.Module):
-    """Simple MLP as used in SwinJSCC."""
-
     def __init__(
         self,
         in_features,
@@ -50,13 +49,6 @@ class Mlp(nn.Module):
 
 
 def window_partition(x: torch.Tensor, window_size: int) -> torch.Tensor:
-    """
-    Args:
-        x: (B, H, W, C)
-        window_size: window size
-    Returns:
-        windows: (num_windows*B, window_size, window_size, C)
-    """
     B, H, W, C = x.shape
     x = x.view(
         B,
@@ -74,16 +66,9 @@ def window_partition(x: torch.Tensor, window_size: int) -> torch.Tensor:
     return windows
 
 
-def window_reverse(windows: torch.Tensor, window_size: int, H: int, W: int) -> torch.Tensor:
-    """
-    Args:
-        windows: (num_windows*B, window_size, window_size, C)
-        window_size: window size
-        H: height of image
-        W: width of image
-    Returns:
-        x: (B, H, W, C)
-    """
+def window_reverse(
+    windows: torch.Tensor, window_size: int, H: int, W: int
+) -> torch.Tensor:
     B = int(windows.shape[0] / (H * W / window_size / window_size))
     x = windows.view(
         B,
@@ -102,8 +87,6 @@ def window_reverse(windows: torch.Tensor, window_size: int, H: int, W: int) -> t
 
 
 class WindowAttention(nn.Module):
-    """Window based multi-head self attention (W-MSA) with relative position bias."""
-
     def __init__(
         self,
         dim: int,
@@ -131,7 +114,7 @@ class WindowAttention(nn.Module):
 
         coords_h = torch.arange(self.window_size[0])
         coords_w = torch.arange(self.window_size[1])
-        coords = torch.stack(torch.meshgrid([coords_h, coords_w]))
+        coords = torch.stack(torch.meshgrid(coords_h, coords_w, indexing="ij"))
         coords_flatten = torch.flatten(coords, 1)
         relative_coords = coords_flatten[:, :, None] - coords_flatten[:, None, :]
         relative_coords = relative_coords.permute(1, 2, 0).contiguous()
@@ -182,7 +165,8 @@ class WindowAttention(nn.Module):
 
         if mask is not None:
             nW = mask.shape[0]
-            attn = attn.view(B_ // nW, nW, self.num_heads, N, N) + mask.unsqueeze(1).unsqueeze(0)
+            attn = attn.view(B_ // nW, nW, self.num_heads, N, N)
+            attn = attn + mask.unsqueeze(1).unsqueeze(0)
             attn = attn.view(-1, self.num_heads, N, N)
         attn = self.softmax(attn)
         attn = self.attn_drop(attn)
@@ -199,8 +183,6 @@ class WindowAttention(nn.Module):
 
 
 class SwinTransformerBlock(nn.Module):
-    """Swin Transformer block with optional shifted windows."""
-
     def __init__(
         self,
         dim: int,
@@ -226,7 +208,7 @@ class SwinTransformerBlock(nn.Module):
         if min(self.input_resolution) <= self.window_size:
             self.shift_size = 0
             self.window_size = min(self.input_resolution)
-        assert 0 <= self.shift_size < self.window_size, "shift_size must be in [0, window_size)"
+        assert 0 <= self.shift_size < self.window_size
 
         self.norm1 = norm_layer(dim)
         self.attn = WindowAttention(
@@ -241,9 +223,7 @@ class SwinTransformerBlock(nn.Module):
         self.norm2 = norm_layer(dim)
         mlp_hidden_dim = int(dim * mlp_ratio)
         self.mlp = Mlp(in_features=dim, hidden_features=mlp_hidden_dim, act_layer=act_layer)
-
-        attn_mask = self._build_attn_mask(device=None)
-        self.register_buffer("attn_mask", attn_mask)
+        self.register_buffer("attn_mask", self._build_attn_mask(device=None))
 
     def _build_attn_mask(self, device: torch.device | None) -> torch.Tensor | None:
         if self.shift_size <= 0:
@@ -288,7 +268,7 @@ class SwinTransformerBlock(nn.Module):
 
         H, W = self.input_resolution
         B, L, C = x.shape
-        assert L == H * W, "input feature has wrong size"
+        assert L == H * W
 
         shortcut = x
         x = self.norm1(x)
@@ -322,15 +302,6 @@ class SwinTransformerBlock(nn.Module):
 
 
 class PatchMerging(nn.Module):
-    r"""Patch Merging Layer.
-
-    Args:
-        input_resolution (tuple[int]): Resolution of input feature.
-        dim (int): Number of input channels.
-        out_dim (int, optional): Output channels. Defaults to dim.
-        norm_layer: Normalization layer.
-    """
-
     def __init__(
         self,
         input_resolution,
@@ -340,45 +311,30 @@ class PatchMerging(nn.Module):
     ):
         super().__init__()
         self.input_resolution = input_resolution
-        if out_dim is None:
-            out_dim = dim
+        out_dim = dim if out_dim is None else out_dim
         self.dim = dim
         self.reduction = nn.Linear(4 * dim, out_dim, bias=False)
         self.norm = norm_layer(4 * dim)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        x: (B, H*W, C)
-        """
         H, W = self.input_resolution
         B, L, C = x.shape
-        assert L == H * W, "input feature has wrong size"
-        assert H % 2 == 0 and W % 2 == 0, f"x size ({H}*{W}) are not even."
+        assert L == H * W
+        assert H % 2 == 0 and W % 2 == 0
 
         x = x.view(B, H, W, C)
         x0 = x[:, 0::2, 0::2, :]
         x1 = x[:, 1::2, 0::2, :]
         x2 = x[:, 0::2, 1::2, :]
         x3 = x[:, 1::2, 1::2, :]
-        x = torch.cat([x0, x1, x2, x3], -1)  # B H/2 W/2 4*C
-        x = x.view(B, H * W // 4, 4 * C)  # B H/2*W/2 4*C
+        x = torch.cat([x0, x1, x2, x3], -1)
+        x = x.view(B, H * W // 4, 4 * C)
         x = self.norm(x)
         x = self.reduction(x)
         return x
 
-    def extra_repr(self) -> str:
-        return f"input_resolution={self.input_resolution}, dim={self.dim}"
-
 
 class PatchReverseMerging(nn.Module):
-    r"""Inverse of PatchMerging.
-
-    Args:
-        input_resolution (tuple[int]): Resolution of input feature.
-        dim (int): Number of input channels.
-        out_dim (int): Output channels after upsampling.
-    """
-
     def __init__(
         self,
         input_resolution,
@@ -394,12 +350,9 @@ class PatchReverseMerging(nn.Module):
         self.norm = norm_layer(dim)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        x: (B, H*W, C)
-        """
         H, W = self.input_resolution
         B, L, C = x.shape
-        assert L == H * W, "input feature has wrong size"
+        assert L == H * W
 
         x = self.norm(x)
         x = self.increment(x)
@@ -408,13 +361,8 @@ class PatchReverseMerging(nn.Module):
         x = x.flatten(2).permute(0, 2, 1)
         return x
 
-    def extra_repr(self) -> str:
-        return f"input_resolution={self.input_resolution}, dim={self.dim}"
-
 
 class PatchEmbed(nn.Module):
-    """Image to patch embedding, Swin-style."""
-
     def __init__(
         self,
         img_size=224,
@@ -434,37 +382,18 @@ class PatchEmbed(nn.Module):
         self.patch_size = patch_size
         self.patches_resolution = patches_resolution
         self.num_patches = patches_resolution[0] * patches_resolution[1]
-
         self.in_chans = in_chans
         self.embed_dim = embed_dim
-
         self.proj = nn.Conv2d(
             in_chans, embed_dim, kernel_size=patch_size, stride=patch_size
         )
-        if norm_layer is not None:
-            self.norm = norm_layer(embed_dim)
-        else:
-            self.norm = None
+        self.norm = norm_layer(embed_dim) if norm_layer is not None else None
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        B, C, H, W = x.shape
-        x = self.proj(x).flatten(2).transpose(1, 2)  # B, Ph*Pw, C
+        x = self.proj(x).flatten(2).transpose(1, 2)
         if self.norm is not None:
             x = self.norm(x)
         return x
-
-    def flops(self) -> int:
-        Ho, Wo = self.patches_resolution
-        flops = (
-            Ho
-            * Wo
-            * self.embed_dim
-            * self.in_chans
-            * (self.patch_size[0] * self.patch_size[1])
-        )
-        if self.norm is not None:
-            flops += Ho * Wo * self.embed_dim
-        return flops
 
 
 class MambaVisionMixer(nn.Module):
@@ -534,7 +463,6 @@ class MambaVisionMixer(nn.Module):
         self.D._no_weight_decay = True
 
         self.out_proj = nn.Linear(self.d_inner, self.d_model, bias=bias, **factory_kwargs)
-
         self.conv1d_x = nn.Conv1d(
             in_channels=self.d_inner // 2,
             out_channels=self.d_inner // 2,
@@ -599,8 +527,7 @@ class MambaVisionMixer(nn.Module):
         )
         y = torch.cat([y, z], dim=1)
         y = rearrange(y, "b d l -> b l d")
-        out = self.out_proj(y)
-        return out
+        return self.out_proj(y)
 
 
 class Attention(nn.Module):
@@ -674,206 +601,7 @@ class Attention(nn.Module):
 MVAttention = Attention
 
 
-class ConvTokenBlock(nn.Module):
-    """
-    Token 版本的 2D ConvBlock（对齐 MambaVision 的 ConvBlock 设计）。
-
-    目的：Stage 1/2 高分辨率下做局部特征提取，同时避免 token-MLP 在大分辨率上带来的巨大 FLOPs。
-
-    输入 / 输出: (B, L, C)，其中 L = H * W。
-    """
-
-    def __init__(
-        self,
-        dim: int,
-        token_mlp_ratio: float = 0.0,
-        drop_path: float = 0.0,
-        layer_scale: float | None = None,
-        kernel_size: int = 3,
-    ):
-        super().__init__()
-        self.dim = dim
-        k = int(kernel_size)
-        pad = k // 2
-
-        # BatchNorm is sensitive to small batch sizes and can cause color/brightness drift
-        # for image reconstruction tasks. Prefer GroupNorm (batch-size independent).
-        def _make_gn(channels: int, max_groups: int = 32) -> nn.GroupNorm:
-            g = min(int(max_groups), int(channels))
-            while g > 1 and (channels % g) != 0:
-                g -= 1
-            g = max(1, g)
-            return nn.GroupNorm(g, channels, eps=1e-5)
-
-        self.conv1 = nn.Conv2d(dim, dim, kernel_size=k, stride=1, padding=pad)
-        self.bn1 = _make_gn(dim)
-        self.act = nn.GELU(approximate="tanh")
-        self.conv2 = nn.Conv2d(dim, dim, kernel_size=k, stride=1, padding=pad)
-        self.bn2 = _make_gn(dim)
-
-        self.layer_scale = layer_scale is not None and isinstance(layer_scale, (int, float))
-        if self.layer_scale:
-            self.gamma = nn.Parameter(float(layer_scale) * torch.ones(dim))
-        else:
-            self.gamma = None
-
-        token_mlp_ratio = float(token_mlp_ratio)
-        if token_mlp_ratio > 0:
-            self.norm_mlp = nn.LayerNorm(dim)
-            self.mlp = Mlp(in_features=dim, hidden_features=int(dim * token_mlp_ratio))
-            if self.layer_scale:
-                self.gamma_mlp = nn.Parameter(float(layer_scale) * torch.ones(dim))
-            else:
-                self.gamma_mlp = None
-        else:
-            self.norm_mlp = None
-            self.mlp = None
-            self.gamma_mlp = None
-
-        self.drop_path = DropPath(float(drop_path)) if drop_path and drop_path > 0 else nn.Identity()
-
-    def forward(self, x: torch.Tensor, resolution: tuple[int, int] | None = None) -> torch.Tensor:
-        # x: (B, L, C) with L = H * W
-        B, L, C = x.shape
-        if resolution is None:
-            # Fallback for legacy callers (square-ish inputs only). Prefer passing `resolution`.
-            H = int(L ** 0.5)
-            W = L // max(H, 1)
-        else:
-            H, W = resolution
-
-        if H <= 0 or W <= 0:
-            raise RuntimeError(f"Invalid resolution for ConvTokenBlock: {(H, W)}")
-
-        if H * W != L:
-            raise RuntimeError(
-                "ConvTokenBlock token length mismatch: "
-                f"L={L}, resolution={(H, W)} (H*W={H * W}). "
-                "Please ensure the caller passes the correct (H,W) for the token grid."
-            )
-
-        # token -> 2D feature map
-        x_2d = x.view(B, H, W, C).permute(0, 3, 1, 2)  # (B, C, H, W)
-        residual = x_2d
-
-        x_2d = self.conv1(x_2d)
-        x_2d = self.bn1(x_2d)
-        x_2d = self.act(x_2d)
-        x_2d = self.conv2(x_2d)
-        x_2d = self.bn2(x_2d)
-
-        if self.layer_scale and self.gamma is not None:
-            x_2d = x_2d * self.gamma.view(1, -1, 1, 1)
-
-        x_2d = residual + self.drop_path(x_2d)
-
-        # 2D -> token
-        x = x_2d.permute(0, 2, 3, 1).reshape(B, L, C)
-
-        if self.mlp is not None and self.norm_mlp is not None:
-            y = self.mlp(self.norm_mlp(x))
-            if self.gamma_mlp is not None:
-                y = y * self.gamma_mlp
-            x = x + self.drop_path(y)
-        return x
-
-
-class HybridConvMixerBlock(nn.Module):
-    """
-    High-res hybrid block: local ConvTokenBlock followed by a token mixer
-    (Mamba or windowed attention).
-    """
-
-    def __init__(
-        self,
-        dim: int,
-        token_mlp_ratio: float,
-        drop_path: float,
-        layer_scale_conv: float | None,
-        conv_kernel_size: int,
-        mlp_ratio: float,
-        num_heads: int,
-        mixer_type: str,
-        window_size: int,
-        layer_scale: float | None,
-        mamba_d_state: int,
-        mamba_d_conv: int,
-        mamba_expand: int,
-    ):
-        super().__init__()
-        self.conv = ConvTokenBlock(
-            dim=dim,
-            token_mlp_ratio=token_mlp_ratio,
-            drop_path=drop_path,
-            layer_scale=layer_scale_conv,
-            kernel_size=conv_kernel_size,
-        )
-
-        mixer = str(mixer_type).lower()
-        use_attention = mixer == "attn"
-        use_mamba = mixer == "mamba"
-        if not (use_attention or use_mamba):
-            raise ValueError(f"Unsupported mixer_type: {mixer_type!r}")
-
-        mixer_window = int(window_size) if use_attention else 0
-        self.mixer = MambaVisionBlock(
-            dim=dim,
-            mlp_ratio=mlp_ratio,
-            num_heads=num_heads,
-            use_mamba=use_mamba,
-            use_attention=use_attention,
-            window_size=mixer_window,
-            drop_path=drop_path,
-            layer_scale=layer_scale,
-            mamba_d_state=mamba_d_state,
-            mamba_d_conv=mamba_d_conv,
-            mamba_expand=mamba_expand,
-        )
-
-    def forward(self, x: torch.Tensor, resolution: tuple[int, int] | None = None) -> torch.Tensor:
-        x = self.conv(x, resolution)
-        x = self.mixer(x, resolution)
-        return x
-
-
-class SSA(nn.Module):
-    """MaIR-style sequence shuffle attention for direction fusion."""
-
-    def __init__(self, dim: int, K: int = 4):
-        super().__init__()
-        self.K = int(K)
-        self.pool = nn.AdaptiveAvgPool2d(1)
-        self.gconv = nn.Conv2d(self.K * dim, self.K * dim, kernel_size=1, groups=dim, bias=True)
-        nn.init.zeros_(self.gconv.weight)
-        nn.init.zeros_(self.gconv.bias)
-
-    def forward(self, feats):
-        K = self.K
-        B, C, H, W = feats[0].shape
-        pooled = [self.pool(f) for f in feats]
-        x = torch.cat(pooled, dim=1)
-        x = x.view(B, K, C, 1, 1).permute(0, 2, 1, 3, 4).reshape(B, K * C, 1, 1)
-        w = self.gconv(x)
-        w = w.view(B, C, K, 1, 1).permute(0, 2, 1, 3, 4).contiguous()
-        w = torch.softmax(w, dim=1)
-        out = 0.0
-        for i in range(K):
-            out = out + w[:, i] * feats[i]
-        return out
-
-
 class MambaVisionBlock(nn.Module):
-    """
-    MambaVision-style block (token mixer + MLP) for JSCC.
-
-    - Each block is either a MambaVisionMixer (SSM-based token mixer) or a Self-Attention block.
-    - Supports optional window partition/reverse (like the official MambaVisionLayer) so that:
-        * the token order preserves 2D locality better;
-        * attention stays tractable for large full-resolution evaluation.
-
-    输入 / 输出: (B, L, C)；当传入 `resolution=(H,W)` 时，要求 L == H*W。
-    """
-
     def __init__(
         self,
         dim: int,
@@ -894,6 +622,7 @@ class MambaVisionBlock(nn.Module):
         self.use_attention = bool(use_attention)
         self.use_mamba = bool(use_mamba) and not self.use_attention
         self.window_size = int(window_size) if window_size is not None else 0
+        self.window_pad_mode = "reflect"
 
         self.norm1 = nn.LayerNorm(dim)
         if self.use_attention:
@@ -918,18 +647,6 @@ class MambaVisionBlock(nn.Module):
             self.mixer = nn.Identity()
 
         self.drop_path = DropPath(drop_path) if drop_path and drop_path > 0 else nn.Identity()
-        self.nss_ws = 8
-        self.nss_shift = False
-        self.nss_dirs = None
-        self.nss_ssa = None
-        self.nss_alpha = nn.Parameter(torch.tensor(0.1))
-        self.nss_shift_mode = "reflect"
-        self.nss_shift_axis = "w"
-        self.nss_shift_multi_dir = False
-        self.window_pad_mode = "reflect"
-        self._nss_logged = False
-        self._nss_cache = {}
-
         use_layer_scale = layer_scale is not None and isinstance(layer_scale, (int, float))
         if use_layer_scale:
             ls = float(layer_scale)
@@ -945,14 +662,7 @@ class MambaVisionBlock(nn.Module):
     def _window_partition(
         self, x: torch.Tensor, H: int, W: int
     ) -> tuple[torch.Tensor, tuple[int, int, int, int, int, int]]:
-        """
-        Partition token sequence into windows.
-
-        Returns:
-          - windows: (B*nW, ws*ws, C)
-          - meta: (H, W, Hp, Wp, pad_b, pad_r)
-        """
-        B, _L, C = x.shape
+        B, _, C = x.shape
         ws = int(self.window_size)
         pad_r = (ws - W % ws) % ws
         pad_b = (ws - H % ws) % ws
@@ -961,9 +671,7 @@ class MambaVisionBlock(nn.Module):
 
         x_2d = x.view(B, H, W, C)
         if pad_r > 0 or pad_b > 0:
-            pad_mode = str(getattr(self, "window_pad_mode", "reflect")).lower()
-            if pad_mode not in ("reflect", "replicate", "constant"):
-                pad_mode = "reflect"
+            pad_mode = self.window_pad_mode
             if pad_mode == "reflect" and (pad_r >= W or pad_b >= H or W <= 1 or H <= 1):
                 pad_mode = "replicate"
             x_2d = F.pad(x_2d, (0, 0, 0, pad_r, 0, pad_b), mode=pad_mode)
@@ -979,263 +687,26 @@ class MambaVisionBlock(nn.Module):
     def _window_reverse(self, windows: torch.Tensor, meta: tuple[int, int, int, int, int, int]) -> torch.Tensor:
         H, W, Hp, Wp, pad_b, pad_r = meta
         ws = int(self.window_size)
-        _, Lw, C = windows.shape
-        if Lw != ws * ws:
-            raise RuntimeError(f"Window token length mismatch: got {Lw}, expected {ws*ws}")
-
         num_windows_per_img = (Hp // ws) * (Wp // ws)
-        if windows.shape[0] % num_windows_per_img != 0:
-            raise RuntimeError(
-                "Window batch mismatch: got "
-                f"{windows.shape[0]} windows, but {num_windows_per_img} per image."
-            )
         B = windows.shape[0] // num_windows_per_img
 
         x_2d = (
-            windows.view(B, Hp // ws, Wp // ws, ws, ws, C)
+            windows.view(B, Hp // ws, Wp // ws, ws, ws, -1)
             .permute(0, 1, 3, 2, 4, 5)
             .contiguous()
-            .view(B, Hp, Wp, C)
+            .view(B, Hp, Wp, -1)
         )
         if pad_b > 0 or pad_r > 0:
             x_2d = x_2d[:, :H, :W, :].contiguous()
-        return x_2d.view(B, H * W, C)
-
-    def _shift_w_noncircular(
-        self, x: torch.Tensor, shift: int, direction: str, mode: str
-    ) -> torch.Tensor:
-        if shift <= 0:
-            return x
-        B, H, W, C = x.shape
-        if W <= 1:
-            return x
-        x_nchw = x.permute(0, 3, 1, 2)
-        x_pad = F.pad(x_nchw, (shift, shift, 0, 0), mode=mode)
-        if direction == "left":
-            start = 2 * shift
-        elif direction == "right":
-            start = 0
-        else:
-            raise ValueError(f"Unsupported shift direction: {direction!r}")
-        x_shift = x_pad[..., start : start + W]
-        return x_shift.permute(0, 2, 3, 1)
-
-    def _shift_h_noncircular(
-        self, x: torch.Tensor, shift: int, direction: str, mode: str
-    ) -> torch.Tensor:
-        if shift <= 0:
-            return x
-        B, H, W, C = x.shape
-        if H <= 1:
-            return x
-        x_nchw = x.permute(0, 3, 1, 2)
-        x_pad = F.pad(x_nchw, (0, 0, shift, shift), mode=mode)
-        if direction == "up":
-            start = 2 * shift
-        elif direction == "down":
-            start = 0
-        else:
-            raise ValueError(f"Unsupported shift direction: {direction!r}")
-        x_shift = x_pad[:, :, start : start + H, :]
-        return x_shift.permute(0, 2, 3, 1)
-
-    def _shift_noncircular(
-        self,
-        x: torch.Tensor,
-        shift: int,
-        axis: str,
-        direction: str,
-        mode: str,
-    ) -> torch.Tensor:
-        if axis == "h":
-            return self._shift_h_noncircular(x, shift, direction, mode)
-        if axis == "w":
-            return self._shift_w_noncircular(x, shift, direction, mode)
-        raise ValueError(f"Unsupported shift axis: {axis!r}")
-
-    def _nss_indices(self, H: int, W: int, device: torch.device) -> tuple[torch.Tensor, torch.Tensor]:
-        ws = int(self.nss_ws)
-        if W > 0:
-            ws = max(1, min(ws, W))
-        device_key = device.index if device.index is not None else -1
-        key = (H, W, ws, device.type, device_key)
-        cached = self._nss_cache.get(key)
-        if cached is not None:
-            return cached
-
-        if H <= 0 or W <= 0:
-            order = torch.arange(0, H * W, device=device, dtype=torch.long)
-            inv = order.clone()
-            self._nss_cache[key] = (order, inv)
-            return order, inv
-
-        idx = torch.arange(H * W, device=device, dtype=torch.long).reshape(1, 1, H, W)
-        full_stripes = W // ws
-
-        for stripe in range(1, full_stripes + 1, 2):
-            start = stripe * ws
-            end = min((stripe + 1) * ws, W)
-            idx[..., start:end] = idx[..., start:end].flip(dims=[-2])
-
-        for row in range(1, H, 2):
-            for stripe in range(full_stripes):
-                start = stripe * ws
-                end = (stripe + 1) * ws
-                idx[..., row, start:end] = idx[..., row, start:end].flip(dims=[-1])
-
-        rem = W - full_stripes * ws
-        if rem > 0:
-            idx_last = idx[..., -rem:]
-            idx_last[..., 1::2, :] = idx_last[..., 1::2, :].flip(dims=[-1])
-            idx_rest = idx[..., : full_stripes * ws]
-        else:
-            idx_last = None
-            idx_rest = idx
-
-        if idx_rest.shape[-1] > 0:
-            stripes = idx_rest.view(1, 1, H, full_stripes, ws).permute(0, 1, 3, 2, 4).contiguous()
-            order = stripes.reshape(-1)
-        else:
-            order = idx_rest.reshape(-1)
-
-        if idx_last is not None:
-            order = torch.cat([order, idx_last.reshape(-1)], dim=0)
-
-        inv = torch.empty_like(order)
-        inv[order] = torch.arange(order.numel(), device=device)
-        self._nss_cache[key] = (order, inv)
-        return order, inv
-
-    def _apply_nss_alpha(self, x: torch.Tensor) -> torch.Tensor:
-        alpha = getattr(self, "nss_alpha", None)
-        if alpha is None:
-            return x
-        return x * alpha
-
-    def _apply_mamba_nss(self, x: torch.Tensor, H: int, W: int) -> torch.Tensor:
-        B, _L, C = x.shape
-        ws = max(1, min(int(self.nss_ws), W))
-        dirs = getattr(self, "nss_dirs", None)
-        shift_mode = str(getattr(self, "nss_shift_mode", "reflect"))
-        shift_axis = str(getattr(self, "nss_shift_axis", "w")).lower()
-        axis_len = H if shift_axis == "h" else W
-        shift = min(ws, axis_len) // 2
-        do_shift = bool(getattr(self, "nss_shift", False)) and shift > 0
-        if dirs is not None and len(dirs) > 1 and not bool(getattr(self, "nss_shift_multi_dir", False)):
-            do_shift = False
-        order, inv = self._nss_indices(H, W, x.device)
-        if dirs is None or len(dirs) <= 1:
-            if do_shift:
-                x = x.reshape(B, H, W, C)
-                if shift_axis == "h":
-                    x = self._shift_noncircular(x, shift, axis="h", direction="up", mode=shift_mode)
-                else:
-                    x = self._shift_noncircular(x, shift, axis="w", direction="left", mode=shift_mode)
-                x = x.reshape(B, H * W, C)
-            x = torch.index_select(x, 1, order)
-            x = self.mixer(x)
-            x = torch.index_select(x, 1, inv)
-            if do_shift:
-                x = x.reshape(B, H, W, C)
-                if shift_axis == "h":
-                    x = self._shift_noncircular(x, shift, axis="h", direction="down", mode=shift_mode)
-                else:
-                    x = self._shift_noncircular(x, shift, axis="w", direction="right", mode=shift_mode)
-                x = x.reshape(B, H * W, C)
-            return self._apply_nss_alpha(x)
-
-        if not self._nss_logged:
-            log = True
-            if torch.distributed.is_available() and torch.distributed.is_initialized():
-                log = torch.distributed.get_rank() == 0
-            if log:
-                print(
-                    f"[NSS] dirs={len(dirs)} ssa={'on' if self.nss_ssa is not None else 'off'} "
-                    f"ws={ws} shift={'on' if do_shift else 'off'} H={H} W={W}"
-                )
-            self._nss_logged = True
-
-        x_base = x.reshape(B, H, W, C)
-        seqs = []
-        for d in dirs:
-            x2d = x_base
-            if d == "brtl":
-                x2d = torch.flip(x2d, dims=(1, 2))
-            elif d == "trbl":
-                x2d = torch.flip(x2d, dims=(2,))
-            elif d == "bltr":
-                x2d = torch.flip(x2d, dims=(1,))
-            elif d != "tlbr":
-                raise ValueError(f"Unsupported NSS dir: {d!r}")
-
-            if do_shift:
-                if shift > 0:
-                    if shift_axis == "h":
-                        x2d = self._shift_noncircular(x2d, shift, axis="h", direction="up", mode=shift_mode)
-                    else:
-                        x2d = self._shift_noncircular(x2d, shift, axis="w", direction="left", mode=shift_mode)
-
-            seq = x2d.reshape(B, H * W, C)
-            seq = torch.index_select(seq, 1, order)
-            seqs.append(seq)
-
-        seq_cat = torch.cat(seqs, dim=0)
-        seq_cat = self.mixer(seq_cat)
-        seq_cat = torch.index_select(seq_cat, 1, inv)
-        seq_chunks = seq_cat.chunk(len(dirs), dim=0)
-
-        outs = []
-        for xs, d in zip(seq_chunks, dirs):
-            x2d_out = xs.reshape(B, H, W, C)
-            if do_shift:
-                if shift > 0:
-                    if shift_axis == "h":
-                        x2d_out = self._shift_noncircular(x2d_out, shift, axis="h", direction="down", mode=shift_mode)
-                    else:
-                        x2d_out = self._shift_noncircular(x2d_out, shift, axis="w", direction="right", mode=shift_mode)
-
-            if d == "brtl":
-                x2d_out = torch.flip(x2d_out, dims=(1, 2))
-            elif d == "trbl":
-                x2d_out = torch.flip(x2d_out, dims=(2,))
-            elif d == "bltr":
-                x2d_out = torch.flip(x2d_out, dims=(1,))
-
-            outs.append(x2d_out.reshape(B, H * W, C))
-
-        ssa = getattr(self, "nss_ssa", None)
-        if ssa is None:
-            x = torch.stack(outs, dim=0).mean(dim=0)
-            return self._apply_nss_alpha(x)
-
-        if int(getattr(ssa, "K", len(outs))) != len(outs):
-            raise ValueError(
-                f"NSS dir SSA mismatch: got {int(getattr(ssa, 'K', -1))}, expected {len(outs)}."
-            )
-        feats = [
-            out.reshape(B, H, W, C).permute(0, 3, 1, 2).contiguous()
-            for out in outs
-        ]
-        x = ssa(feats).permute(0, 2, 3, 1).reshape(B, H * W, C)
-        return self._apply_nss_alpha(x)
+        return x_2d.view(B, H * W, -1)
 
     def _apply_mixer(self, x: torch.Tensor, resolution: tuple[int, int] | None) -> torch.Tensor:
-        if self.use_mamba and resolution is not None:
-            H, W = resolution
-            if H > 0 and W > 0 and x.shape[1] == H * W:
-                if self.window_size and int(self.window_size) > 0:
-                    windows, meta = self._window_partition(x, H, W)
-                    ws = int(self.window_size)
-                    windows = self._apply_mamba_nss(windows, ws, ws)
-                    return self._window_reverse(windows, meta)
-                return self._apply_mamba_nss(x, H, W)
+        if self.use_mamba:
             return self.mixer(x)
         if self.window_size <= 0 or resolution is None:
             return self.mixer(x)
         H, W = resolution
-        if H <= 0 or W <= 0:
-            return self.mixer(x)
-        if x.shape[1] != H * W:
+        if H <= 0 or W <= 0 or x.shape[1] != H * W:
             return self.mixer(x)
 
         windows, meta = self._window_partition(x, H, W)
@@ -1268,14 +739,6 @@ def _expand_drop_path(drop_path, depth: int) -> list[float]:
 
 
 class MambaEncoderLayer(nn.Module):
-    """
-    编码端分层 stage：
-      - Stage1/2：ConvTokenBlock
-      - Stage3/4：前半 MambaVisionMixer，后半 Self-Attention
-
-    输入 / 输出: (B, H*W, C)
-    """
-
     def __init__(
         self,
         dim: int,
@@ -1304,24 +767,19 @@ class MambaEncoderLayer(nn.Module):
         self.out_dim = out_dim
         self.input_resolution = input_resolution
         self.depth = depth
-        self.stage_index = stage_index
 
-        # patch merging 层（负责分辨率 / 通道变化）
-        if downsample is not None:
-            self.downsample = downsample(
-                input_resolution, dim=dim, out_dim=out_dim, norm_layer=norm_layer
-            )
-        else:
-            self.downsample = None
+        self.downsample = (
+            downsample(input_resolution, dim=dim, out_dim=out_dim, norm_layer=norm_layer)
+            if downsample is not None
+            else None
+        )
 
         block_dim = out_dim
         dprs = _expand_drop_path(drop_path, depth)
-
         block_resolution = input_resolution
         if self.downsample is not None:
             block_resolution = (input_resolution[0] // 2, input_resolution[1] // 2)
 
-        # Stage1/2: Swin (SW-MSA); Stage3/4: Mamba mixer then Swin.
         if stage_index <= 1:
             self.blocks = nn.ModuleList(
                 [
@@ -1341,10 +799,7 @@ class MambaEncoderLayer(nn.Module):
                 ]
             )
         else:
-            if depth <= 1:
-                mamba_depth = depth
-            else:
-                mamba_depth = max(1, min(depth // 2, depth - 1))
+            mamba_depth = depth if depth <= 1 else max(1, min(depth // 2, depth - 1))
             self.blocks = nn.ModuleList()
             for i in range(depth):
                 if i < mamba_depth:
@@ -1386,10 +841,7 @@ class MambaEncoderLayer(nn.Module):
             x = self.downsample(x)
             H, W = H // 2, W // 2
         for blk in self.blocks:
-            if isinstance(blk, ConvTokenBlock):
-                x = blk(x, (H, W))
-            else:
-                x = blk(x, (H, W))
+            x = blk(x, (H, W))
         return x
 
     def update_resolution(self, H: int, W: int):
@@ -1407,14 +859,6 @@ class MambaEncoderLayer(nn.Module):
 
 
 class MambaDecoderLayer(nn.Module):
-    """
-    解码端分层 stage（分辨率意义上与编码对称）：
-      - 低分辨率 stage（stage_index <= 1）：MambaVisionMixer + Self-Attn
-      - 高分辨率 stage（stage_index >= 2）：ConvTokenBlock
-
-    输入 / 输出: (B, H*W, C)
-    """
-
     def __init__(
         self,
         dim: int,
@@ -1431,8 +875,6 @@ class MambaDecoderLayer(nn.Module):
         layer_scale_conv: float | None = None,
         conv_kernel_size: int = 3,
         conv_token_mlp_ratio: float = 0.0,
-        highres_mixer: str = "conv",
-        post_upsample_attn_depth: int = 0,
         upsample=None,
         mamba_d_state: int = 8,
         mamba_d_conv: int = 3,
@@ -1445,36 +887,29 @@ class MambaDecoderLayer(nn.Module):
         self.out_dim = out_dim
         self.input_resolution = input_resolution
         self.depth = depth
-        self.stage_index = stage_index
         dprs = _expand_drop_path(drop_path, depth)
 
-        # Low-res: Mamba then Swin; High-res: Swin only.
         if stage_index <= 1:
-            if depth <= 1:
-                mamba_depth = depth
-            else:
-                mamba_depth = max(1, min(depth // 2, depth - 1))
+            mamba_depth = depth if depth <= 1 else max(1, min(depth // 2, depth - 1))
             self.blocks = nn.ModuleList()
             for i in range(depth):
                 if i < mamba_depth:
-                    block = MambaVisionBlock(
-                        dim=dim,
-                        mlp_ratio=mlp_ratio,
-                        num_heads=num_heads,
-                        use_mamba=True,
-                        use_attention=False,
-                        window_size=0,
-                        drop_path=dprs[i],
-                        layer_scale=layer_scale,
-                        mamba_d_state=mamba_d_state,
-                        mamba_d_conv=mamba_d_conv,
-                        mamba_expand=mamba_expand,
-                        attn_gate=attn_gate_mv,
+                    self.blocks.append(
+                        MambaVisionBlock(
+                            dim=dim,
+                            mlp_ratio=mlp_ratio,
+                            num_heads=num_heads,
+                            use_mamba=True,
+                            use_attention=False,
+                            window_size=0,
+                            drop_path=dprs[i],
+                            layer_scale=layer_scale,
+                            mamba_d_state=mamba_d_state,
+                            mamba_d_conv=mamba_d_conv,
+                            mamba_expand=mamba_expand,
+                            attn_gate=attn_gate_mv,
+                        )
                     )
-                    block.nss_shift = (i % 2 == 1)
-                    block.nss_dirs = ("tlbr", "brtl", "trbl", "bltr")
-                    block.nss_ssa = SSA(dim=dim, K=len(block.nss_dirs))
-                    self.blocks.append(block)
                 else:
                     self.blocks.append(
                         SwinTransformerBlock(
@@ -1509,75 +944,11 @@ class MambaDecoderLayer(nn.Module):
                 ]
             )
 
-        if upsample is not None:
-            self.upsample = upsample(
-                input_resolution, dim=dim, out_dim=out_dim, norm_layer=norm_layer
-            )
-        else:
-            self.upsample = None
-
-        self.post_upsample_mamba = None
-        if self.upsample is not None and int(stage_index) >= 2 and int(out_dim) > 3:
-            self.post_upsample_mamba = MambaVisionBlock(
-                dim=int(out_dim),
-                mlp_ratio=mlp_ratio,
-                num_heads=num_heads,
-                use_mamba=True,
-                use_attention=False,
-                window_size=window_size,
-                drop_path=0.0,
-                layer_scale=layer_scale,
-                mamba_d_state=mamba_d_state,
-                mamba_d_conv=mamba_d_conv,
-                mamba_expand=mamba_expand,
-                attn_gate=attn_gate_mv,
-            )
-            self.post_upsample_mamba.nss_dirs = ("tlbr", "brtl")
-            self.post_upsample_mamba.nss_ssa = SSA(
-                dim=int(out_dim),
-                K=len(self.post_upsample_mamba.nss_dirs),
-            )
-            self.post_upsample_mamba.nss_shift = True
-            if int(window_size) > 0:
-                self.post_upsample_mamba.nss_ws = int(window_size)
-            # Alternate shift axis across high-res stages to reduce directional bias.
-            if int(stage_index) % 2 == 1:
-                self.post_upsample_mamba.nss_shift_axis = "h"
-
-        self.post_upsample_blocks = nn.ModuleList()
-        post_upsample_attn_depth = int(post_upsample_attn_depth)
-        # Only apply post-upsampling attention for high-res decoder stages (>=2) and when we still have feature channels.
-        if (
-            post_upsample_attn_depth > 0
-            and self.upsample is not None
-            and int(stage_index) >= 2
-            and int(out_dim) > 3
-        ):
-            # Ensure num_heads divides out_dim for attention.
-            heads = int(num_heads) if int(num_heads) > 0 else 1
-            if int(out_dim) % heads != 0:
-                candidate = heads
-                while candidate > 1 and (int(out_dim) % candidate) != 0:
-                    candidate -= 1
-                heads = max(1, candidate)
-
-            for _ in range(post_upsample_attn_depth):
-                self.post_upsample_blocks.append(
-                    MambaVisionBlock(
-                        dim=int(out_dim),
-                        mlp_ratio=mlp_ratio,
-                        num_heads=heads,
-                        use_mamba=False,
-                        use_attention=True,
-                        window_size=window_size,
-                        drop_path=0.0,
-                        layer_scale=layer_scale,
-                        mamba_d_state=mamba_d_state,
-                        mamba_d_conv=mamba_d_conv,
-                        mamba_expand=mamba_expand,
-                        attn_gate=attn_gate_mv,
-                    )
-                )
+        self.upsample = (
+            upsample(input_resolution, dim=dim, out_dim=out_dim, norm_layer=norm_layer)
+            if upsample is not None
+            else None
+        )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         H, W = self.input_resolution
@@ -1585,11 +956,6 @@ class MambaDecoderLayer(nn.Module):
             x = blk(x, (H, W))
         if self.upsample is not None:
             x = self.upsample(x)
-            H, W = H * 2, W * 2
-            if self.post_upsample_mamba is not None:
-                x = self.post_upsample_mamba(x, (H, W))
-            for blk in self.post_upsample_blocks:
-                x = blk(x, (H, W))
         return x
 
     def update_resolution(self, H: int, W: int):

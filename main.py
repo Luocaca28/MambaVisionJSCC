@@ -91,17 +91,6 @@ def _load_checkpoint_state_dict(path: str) -> dict:
     if any(str(k).startswith("module.") for k in ckpt.keys()):
         ckpt = {str(k)[len("module.") :]: v for k, v in ckpt.items()}
 
-    # Backward-compat: older checkpoints used *_list1 naming for the SNR-aware (SA) branch.
-    # Map them to the current names so `--ckpt-strict` can still work.
-    remapped: dict[str, object] = {}
-    for k, v in ckpt.items():
-        nk = str(k)
-        nk = nk.replace("encoder.bm_list1.", "encoder.bm_list.")
-        nk = nk.replace("encoder.sm_list1.", "encoder.sm_list.")
-        nk = nk.replace("encoder.sigmoid1.", "encoder.sigmoid.")
-        nk = nk.replace("encoder.sigmoid1", "encoder.sigmoid")
-        remapped[nk] = v
-    ckpt = remapped
     return ckpt
 
 
@@ -150,12 +139,9 @@ parser.add_argument(
 parser.add_argument(
     "--model",
     type=str,
-    default="MambaVisionJSCC_w/_SA",
-    choices=[
-        "MambaVisionJSCC_w/o_SAandRA",
-        "MambaVisionJSCC_w/_SA",
-    ],
-    help="MambaVisionJSCC variant: plain vs SA (SNR-aware)",
+    default="MambaVisionJSCC",
+    choices=["MambaVisionJSCC"],
+    help="model name (single clean MambaVisionJSCC path)",
 )
 parser.add_argument(
     "--channel-type",
@@ -353,19 +339,6 @@ parser.add_argument(
     help="token-MLP ratio inside ConvTokenBlock for decoder high-res conv stages (0 disables). Default 0 for baseline behavior.",
 )
 parser.add_argument(
-    "--dec-highres-mixer",
-    type=str,
-    default="conv",
-    choices=["conv", "conv_mamba", "conv_attn"],
-    help="decoder high-res block type: conv only (default), or conv+mamba / conv+attn.",
-)
-parser.add_argument(
-    "--dec-post-up-attn",
-    type=int,
-    default=0,
-    help="number of window-attention blocks appended AFTER upsampling in decoder high-res stages (>=2).",
-)
-parser.add_argument(
     "--dec-refine",
     action=argparse.BooleanOptionalAction,
     default=False,
@@ -502,13 +475,7 @@ parser.add_argument(
 args = parser.parse_args()
 # Hard-coded experiment policy (not user-configurable via CLI).
 # These are forced after parsing so command-line flags cannot change them.
-args.save_final_only = True
-args.distributed_eval = True
-args.log_cbr = False
-# When eval_full_res is enabled, default to tiled full-resolution evaluation to avoid OOM.
 args.eval_direct_full_res = False
-if args.eval_crop_size is None:
-    args.eval_full_res = True
 
 # RA (rate-adaptive) has been removed: disallow comma-separated multi-rate `--C`.
 _c_parts = [p.strip() for p in str(getattr(args, "C", "")).split(",") if p.strip()]
@@ -668,10 +635,7 @@ def _profile_model_and_save(
             iters = warmup + steps
             for _ in range(iters):
                 with torch.inference_mode():
-                    if hasattr(model, "forward_recon"):
-                        _ = model.forward_recon(x, snr, rate)
-                    else:
-                        _ = model(x, snr, rate)
+                    _ = model(x, snr, rate)
                 if torch.cuda.is_available():
                     torch.cuda.synchronize()
                 prof.step()
@@ -821,8 +785,6 @@ class Config:
             self.layer_scale_conv = _v if _v and _v > 0 else None
         self.enc_conv_mlp_ratio = max(0.0, float(getattr(args, "enc_conv_mlp_ratio", 0.0)))
         self.dec_conv_mlp_ratio = max(0.0, float(getattr(args, "dec_conv_mlp_ratio", 0.0)))
-        self.dec_highres_mixer = str(getattr(args, "dec_highres_mixer", "conv"))
-        self.dec_post_up_attn = max(0, int(getattr(args, "dec_post_up_attn", 0)))
         self.dec_refine = bool(getattr(args, "dec_refine", False))
         self.dec_refine_ch = max(8, int(getattr(args, "dec_refine_ch", 32)))
         self.dec_refine_depth = max(1, int(getattr(args, "dec_refine_depth", 2)))
@@ -871,9 +833,9 @@ class Config:
             base_path = "/home/LYC/lcy/Datasets/"
 
             # 固定数据划分：train / val / test
-            self.train_data_dir = [base_path + "DIV2K/DIV2K_train_HR/"]
-            self.val_data_dir = [base_path + "DIV2K/DIV2K_valid_HR/"]
-            self.test_data_dir = [base_path + "DIV2K/Kodak24/"]
+            self.train_data_dir = ["/home/LYC/lcy/Datasets/Underwater_EUVP_CropOnly_256/"]
+            self.val_data_dir = ["/home/LYC/lcy/Datasets/Underwater_EUVP_CropOnly_256/"]
+            self.test_data_dir = ["/home/LYC/lcy/Datasets/UFO_images_256/"]
             self.batch_size = 16
             self.downsample = 4
             vf = int(getattr(args, "val_freq", 5))
@@ -961,11 +923,7 @@ class Config:
                 layer_scale=self.layer_scale,
                 layer_scale_conv=self.layer_scale_conv,
                 conv_token_mlp_ratio=self.dec_conv_mlp_ratio,
-                # Scheme B: use a slightly larger local receptive field for high-res ConvTokenBlocks in decoder.
-                # (Low-res stages use MambaVisionBlock and are unaffected.)
                 conv_kernel_size=5,
-                highres_mixer=self.dec_highres_mixer,
-                post_upsample_attn_depth=self.dec_post_up_attn,
                 refine_head=self.dec_refine,
                 refine_channels=self.dec_refine_ch,
                 refine_depth=self.dec_refine_depth,
@@ -1194,10 +1152,7 @@ def _reconstruct_fullres_direct(
     x, (orig_h, orig_w) = _pad_to_multiple(input_image, pad_multiple)
     net_module = net.module if hasattr(net, "module") else net
     with torch.amp.autocast("cuda", enabled=amp_enabled):
-        if hasattr(net_module, "forward_recon"):
-            recon, CBR, SNR_out = net_module.forward_recon(x, snr, rate)
-        else:  # pragma: no cover
-            recon, CBR, SNR_out, _mse, _loss = net(x, snr, rate)
+        recon, CBR, SNR_out, _, _ = net(x, snr, rate)
 
     recon = recon.clamp(0.0, 1.0)
     recon = recon[:, :, :orig_h, :orig_w]
@@ -1255,16 +1210,11 @@ def _reconstruct_fullres_tiled(
 
     cbr_val = None
     snr_out_val = None
-    net_module = net.module if hasattr(net, "module") else net
-
     for top in range(0, Hp - tile + 1, stride):
         for left in range(0, Wp - tile + 1, stride):
             patch = x[:, :, top : top + tile, left : left + tile]
             with torch.amp.autocast("cuda", enabled=amp_enabled):
-                if hasattr(net_module, "forward_recon"):
-                    recon_patch, CBR, SNR_out = net_module.forward_recon(patch, snr, rate)
-                else:  # pragma: no cover
-                    recon_patch, CBR, SNR_out, _mse, _loss = net(patch, snr, rate)
+                recon_patch, CBR, SNR_out, _, _ = net(patch, snr, rate)
             if cbr_val is None:
                 cbr_val = float(CBR)
             if snr_out_val is None:

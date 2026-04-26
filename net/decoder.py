@@ -1,9 +1,7 @@
 import torch
 import torch.nn as nn
 
-from net.modules import PatchReverseMerging, trunc_normal_
-from net.modules import MambaDecoderLayer
-from net.encoder import AdaptiveModulator
+from net.modules import MambaDecoderLayer, PatchReverseMerging, trunc_normal_
 
 
 class ResidualRefineBlock(nn.Module):
@@ -18,14 +16,7 @@ class ResidualRefineBlock(nn.Module):
 
 
 class MambaJSCC_Decoder(nn.Module):
-    """
-    MambaVision-based decoder for JSCC.
-
-    结构与 SwinJSCC_Decoder 对齐：
-      - 多个 stage（MambaDecoderLayer）
-      - 可选 SNR-aware 解码调制
-      - 输出尺寸与输入图像一致 (B,3,H,W)
-    """
+    """Hierarchical MambaVision decoder for JSCC."""
 
     def __init__(
         self,
@@ -46,8 +37,6 @@ class MambaJSCC_Decoder(nn.Module):
         layer_scale_conv: float | None = None,
         conv_kernel_size: int = 3,
         conv_token_mlp_ratio: float = 0.0,
-        highres_mixer: str = "conv",
-        post_upsample_attn_depth: int = 0,
         refine_head: bool = True,
         refine_channels: int = 32,
         refine_depth: int = 2,
@@ -77,12 +66,9 @@ class MambaJSCC_Decoder(nn.Module):
         )
         num_patches = self.H // 4 * self.W // 4
         if self.ape:
-            self.absolute_pos_embed = nn.Parameter(
-                torch.zeros(1, num_patches, embed_dims[0])
-            )
+            self.absolute_pos_embed = nn.Parameter(torch.zeros(1, num_patches, embed_dims[0]))
             trunc_normal_(self.absolute_pos_embed, std=0.02)
 
-        # hierarchical decoder stages
         if layer_scale_conv is None:
             layer_scale_conv = layer_scale
 
@@ -101,9 +87,7 @@ class MambaJSCC_Decoder(nn.Module):
         for i_layer in range(self.num_layers):
             layer = MambaDecoderLayer(
                 dim=int(embed_dims[i_layer]),
-                out_dim=int(embed_dims[i_layer + 1])
-                if (i_layer < self.num_layers - 1)
-                else 3,
+                out_dim=int(embed_dims[i_layer + 1]) if (i_layer < self.num_layers - 1) else 3,
                 input_resolution=(
                     self.patches_resolution[0] * (2 ** i_layer),
                     self.patches_resolution[1] * (2 ** i_layer),
@@ -121,8 +105,6 @@ class MambaJSCC_Decoder(nn.Module):
                 layer_scale_conv=layer_scale_conv,
                 conv_kernel_size=conv_kernel_size,
                 conv_token_mlp_ratio=conv_token_mlp_ratio,
-                highres_mixer=highres_mixer,
-                post_upsample_attn_depth=post_upsample_attn_depth,
                 upsample=PatchReverseMerging,
                 mamba_d_state=mamba_d_state,
                 mamba_d_conv=mamba_d_conv,
@@ -133,8 +115,7 @@ class MambaJSCC_Decoder(nn.Module):
             dpr_ptr += int(depths[i_layer])
             self.layers.append(layer)
 
-        if C is not None:
-            self.head_list = nn.Linear(C, embed_dims[0])
+        self.head_list = nn.Linear(C, embed_dims[0])
 
         self.refine_scale = float(refine_scale)
         if bool(refine_head):
@@ -151,58 +132,15 @@ class MambaJSCC_Decoder(nn.Module):
             self.refine_head = None
         self.apply(self._init_weights)
 
-        self.hidden_dim = int(self.embed_dims[0] * 1.5)
-        self.layer_num = layer_num = 7
-        self.bm_list = nn.ModuleList()
-        self.sm_list = nn.ModuleList()
-        self.sm_list.append(nn.Linear(self.embed_dims[0], self.hidden_dim))
-        for i in range(layer_num):
-            if i == layer_num - 1:
-                outdim = self.embed_dims[0]
-            else:
-                outdim = self.hidden_dim
-            self.bm_list.append(AdaptiveModulator(self.hidden_dim))
-            self.sm_list.append(nn.Linear(self.hidden_dim, outdim))
-        self.sigmoid = nn.Sigmoid()
-
-    def forward(self, x, snr, model):
-        if model == "MambaVisionJSCC_w/o_SAandRA":
-            x = self.head_list(x)
-            for layer in self.layers:
-                x = layer(x)
-            B, L, N = x.shape
-            x = x.reshape(B, self.H, self.W, N).permute(0, 3, 1, 2)
-            return self._refine(x)
-
-        elif model == "MambaVisionJSCC_w/_SA":
-            B, L, C = x.size()
-            device = x.device
-            x = self.head_list(x)
-            snr_cuda = torch.tensor(snr, dtype=torch.float, device=device)
-            snr_batch = snr_cuda.unsqueeze(0).expand(B, -1)
-            for i in range(self.layer_num):
-                if i == 0:
-                    temp = self.sm_list[i](x.detach())
-                else:
-                    temp = self.sm_list[i](temp)
-                bm = (
-                    self.bm_list[i](snr_batch)
-                    .unsqueeze(1)
-                    .expand(-1, L, -1)
-                )
-                temp = temp * bm
-            mod_val = self.sigmoid(self.sm_list[-1](temp))
-            x = x * mod_val
-            for layer in self.layers:
-                x = layer(x)
-            B, L, N = x.shape
-            x = x.reshape(B, self.H, self.W, N).permute(0, 3, 1, 2)
-            return self._refine(x)
-
-        raise ValueError(f"Unsupported model variant (RA removed): {model}")
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.head_list(x)
+        for layer in self.layers:
+            x = layer(x)
+        B, L, N = x.shape
+        x = x.reshape(B, self.H, self.W, N).permute(0, 3, 1, 2)
+        return self._refine(x)
 
     def _refine(self, x: torch.Tensor) -> torch.Tensor:
-        # x: (B, 3, H, W)
         if self.refine_head is None:
             return x
         residual = self.refine_head(x) * self.refine_scale
