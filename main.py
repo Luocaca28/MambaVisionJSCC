@@ -833,9 +833,9 @@ class Config:
             base_path = "/home/LYC/lcy/Datasets/"
 
             # 固定数据划分：train / val / test
-            self.train_data_dir = ["/home/LYC/lcy/Datasets/Underwater_EUVP_CropOnly_256/"]
-            self.val_data_dir = ["/home/LYC/lcy/Datasets/Underwater_EUVP_CropOnly_256/"]
-            self.test_data_dir = ["/home/LYC/lcy/Datasets/UFO_images_256/"]
+            self.train_data_dir = ["/home/LYC/lcy/Datasets/DIV2K/DIV2K_train_HR/"]
+            self.val_data_dir = ["/home/LYC/lcy/Datasets/DIV2K/DIV2K_valid_HR/"]
+            self.test_data_dir = ["/home/LYC/lcy/Datasets/DIV2K/Kodak24/"]
             self.batch_size = 16
             self.downsample = 4
             vf = int(getattr(args, "val_freq", 5))

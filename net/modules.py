@@ -204,6 +204,7 @@ class SwinTransformerBlock(nn.Module):
         self.window_size = window_size
         self.shift_size = shift_size
         self.mlp_ratio = mlp_ratio
+        self.window_pad_mode = "reflect"
 
         if min(self.input_resolution) <= self.window_size:
             self.shift_size = 0
@@ -225,21 +226,60 @@ class SwinTransformerBlock(nn.Module):
         self.mlp = Mlp(in_features=dim, hidden_features=mlp_hidden_dim, act_layer=act_layer)
         self.register_buffer("attn_mask", self._build_attn_mask(device=None))
 
+    def _pad_to_window_size(
+        self, x: torch.Tensor
+    ) -> tuple[torch.Tensor, tuple[int, int, int, int, int, int]]:
+        B, H, W, C = x.shape
+        ws = int(self.window_size)
+        pad_b = (ws - H % ws) % ws
+        pad_r = (ws - W % ws) % ws
+        Hp = H + pad_b
+        Wp = W + pad_r
+
+        if pad_b > 0 or pad_r > 0:
+            pad_mode = self.window_pad_mode
+            if pad_mode == "reflect" and (pad_r >= W or pad_b >= H or W <= 1 or H <= 1):
+                pad_mode = "replicate"
+            x = F.pad(x, (0, 0, 0, pad_r, 0, pad_b), mode=pad_mode)
+        return x, (H, W, Hp, Wp, pad_b, pad_r)
+
+    def _window_partition(
+        self, x: torch.Tensor
+    ) -> tuple[torch.Tensor, tuple[int, int, int, int, int, int]]:
+        x_pad, meta = self._pad_to_window_size(x)
+        return window_partition(x_pad, self.window_size), meta
+
+    def _window_reverse(
+        self,
+        windows: torch.Tensor,
+        meta: tuple[int, int, int, int, int, int],
+    ) -> torch.Tensor:
+        H, W, Hp, Wp, pad_b, pad_r = meta
+        x = window_reverse(windows, self.window_size, Hp, Wp)
+        if pad_b > 0 or pad_r > 0:
+            x = x[:, :H, :W, :].contiguous()
+        return x
+
     def _build_attn_mask(self, device: torch.device | None) -> torch.Tensor | None:
         if self.shift_size <= 0:
             return None
         H, W = self.input_resolution
         if device is None:
             device = torch.device("cpu")
-        img_mask = torch.zeros((1, H, W, 1), device=device)
+        ws = int(self.window_size)
+        pad_b = (ws - H % ws) % ws
+        pad_r = (ws - W % ws) % ws
+        Hp = H + pad_b
+        Wp = W + pad_r
+        img_mask = torch.zeros((1, Hp, Wp, 1), device=device)
         h_slices = (
-            slice(0, -self.window_size),
-            slice(-self.window_size, -self.shift_size),
+            slice(0, -ws),
+            slice(-ws, -self.shift_size),
             slice(-self.shift_size, None),
         )
         w_slices = (
-            slice(0, -self.window_size),
-            slice(-self.window_size, -self.shift_size),
+            slice(0, -ws),
+            slice(-ws, -self.shift_size),
             slice(-self.shift_size, None),
         )
         cnt = 0
@@ -248,8 +288,8 @@ class SwinTransformerBlock(nn.Module):
                 img_mask[:, h, w, :] = cnt
                 cnt += 1
 
-        mask_windows = window_partition(img_mask, self.window_size)
-        mask_windows = mask_windows.view(-1, self.window_size * self.window_size)
+        mask_windows = window_partition(img_mask, ws)
+        mask_windows = mask_windows.view(-1, ws * ws)
         attn_mask = mask_windows.unsqueeze(1) - mask_windows.unsqueeze(2)
         attn_mask = attn_mask.masked_fill(attn_mask != 0, float(-100.0)).masked_fill(
             attn_mask == 0, float(0.0)
@@ -281,12 +321,12 @@ class SwinTransformerBlock(nn.Module):
         else:
             shifted_x = x
 
-        x_windows = window_partition(shifted_x, self.window_size)
+        x_windows, meta = self._window_partition(shifted_x)
         x_windows = x_windows.view(-1, self.window_size * self.window_size, C)
 
         attn_windows = self.attn(x_windows, mask=self.attn_mask)
         attn_windows = attn_windows.view(-1, self.window_size, self.window_size, C)
-        shifted_x = window_reverse(attn_windows, self.window_size, H, W)
+        shifted_x = self._window_reverse(attn_windows, meta)
 
         if self.shift_size > 0:
             x = torch.roll(
