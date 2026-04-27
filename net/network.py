@@ -8,6 +8,7 @@ from loss.distortion import Distortion
 from net.channel import Channel
 from net.decoder import create_mamba_decoder
 from net.encoder import create_mamba_encoder
+from net.snr_film import SNRFiLM
 
 
 class MambaVisionJSCC(nn.Module):
@@ -71,6 +72,34 @@ class MambaVisionJSCC(nn.Module):
         self.multiple_snr = [int(snr) for snr in str(args.multiple_snr).split(",")]
         self.channel_number = int(str(args.C).split(",")[0])
         self.downsample = config.downsample
+        self.snr_film_position = str(getattr(config, "snr_film_position", "none"))
+        self.use_snr_film = self.snr_film_position != "none"
+
+        snr_min = float(min(self.multiple_snr))
+        snr_max = float(max(self.multiple_snr))
+        snr_hidden = int(getattr(config, "snr_film_hidden", 64))
+        snr_film_scale = float(getattr(config, "snr_film_scale", 0.1))
+
+        if self.use_snr_film:
+            self.enc_snr_film = SNRFiLM(
+                dim=self.channel_number,
+                hidden_dim=snr_hidden,
+                snr_min=snr_min,
+                snr_max=snr_max,
+                film_scale=snr_film_scale,
+                identity_init=True,
+            )
+            self.dec_snr_film = SNRFiLM(
+                dim=self.channel_number,
+                hidden_dim=snr_hidden,
+                snr_min=snr_min,
+                snr_max=snr_max,
+                film_scale=snr_film_scale,
+                identity_init=True,
+            )
+        else:
+            self.enc_snr_film = None
+            self.dec_snr_film = None
 
     def feature_pass_channel(self, feature, chan_param, avg_pwr=False):
         return self.channel(feature, chan_param, avg_pwr)
@@ -110,12 +139,19 @@ class MambaVisionJSCC(nn.Module):
             )
 
         feature = self.encoder(input_pad)
+
+        if self.snr_film_position in ["enc", "both"]:
+            feature = self.enc_snr_film(feature, chan_param)
+
         cbr = feature.numel() / 2 / input_image.numel()
         noisy_feature = (
             self.feature_pass_channel(feature, chan_param)
             if bool(getattr(self.config, "pass_channel", True))
             else feature
         )
+
+        if self.snr_film_position in ["dec", "both"]:
+            noisy_feature = self.dec_snr_film(noisy_feature, chan_param)
 
         recon_image = self.decoder(noisy_feature)
         if pad_h > 0 or pad_w > 0:

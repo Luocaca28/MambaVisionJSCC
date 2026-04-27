@@ -163,6 +163,30 @@ parser.add_argument(
     help="comma separated SNR list, e.g., '5,10,15'",
 )
 parser.add_argument(
+    "--use-snr-film",
+    action="store_true",
+    help="Enable lightweight SNR-conditioned FiLM modulation at JSCC bottleneck.",
+)
+parser.add_argument(
+    "--snr-film-hidden",
+    type=int,
+    default=64,
+    help="Hidden dimension of SNR-FiLM MLP.",
+)
+parser.add_argument(
+    "--snr-film-scale",
+    type=float,
+    default=0.1,
+    help="Residual scale of SNR-FiLM modulation.",
+)
+parser.add_argument(
+    "--snr-film-position",
+    type=str,
+    default="both",
+    choices=["none", "enc", "dec", "both"],
+    help="Where to apply SNR-FiLM: none, enc, dec, or both.",
+)
+parser.add_argument(
     "--pretrain-no-channel-epochs",
     type=int,
     default=0,
@@ -789,6 +813,10 @@ class Config:
         self.dec_refine_ch = max(8, int(getattr(args, "dec_refine_ch", 32)))
         self.dec_refine_depth = max(1, int(getattr(args, "dec_refine_depth", 2)))
         self.dec_refine_scale = float(getattr(args, "dec_refine_scale", 0.1))
+        self.use_snr_film = args.use_snr_film
+        self.snr_film_hidden = args.snr_film_hidden
+        self.snr_film_scale = args.snr_film_scale
+        self.snr_film_position = args.snr_film_position
 
         # logger / 路径
         self.print_step = 100
