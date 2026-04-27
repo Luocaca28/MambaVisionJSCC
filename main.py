@@ -163,6 +163,12 @@ parser.add_argument(
     help="comma separated SNR list, e.g., '5,10,15'",
 )
 parser.add_argument(
+    "--seed",
+    type=int,
+    default=42,
+    help="random seed for reproducibility",
+)
+parser.add_argument(
     "--use-snr-film",
     action="store_true",
     help="Enable lightweight SNR-conditioned FiLM modulation at JSCC bottleneck.",
@@ -180,9 +186,24 @@ parser.add_argument(
     help="Residual scale of SNR-FiLM modulation.",
 )
 parser.add_argument(
+    "--use-dec-latent-refiner",
+    action="store_true",
+    help="Enable SNR-conditioned received latent refiner before decoder.",
+)
+parser.add_argument(
+    "--dec-latent-refiner-hidden",
+    type=int,
+    default=128,
+)
+parser.add_argument(
+    "--dec-latent-refiner-scale",
+    type=float,
+    default=0.1,
+)
+parser.add_argument(
     "--snr-film-position",
     type=str,
-    default="both",
+    default="none",
     choices=["none", "enc", "dec", "both"],
     help="Where to apply SNR-FiLM: none, enc, dec, or both.",
 )
@@ -605,6 +626,41 @@ def _unique_path(path: str) -> str:
         i += 1
 
 
+def _safe_name(s: str) -> str:
+    """Make a string safe for folder/file names."""
+    s = str(s)
+    for ch in ["/", "\\", ":", "*", "?", "\"", "<", ">", "|", " ", ","]:
+        s = s.replace(ch, "-")
+    while "--" in s:
+        s = s.replace("--", "-")
+    return s.strip("-")
+
+
+def _build_run_tag(args) -> str:
+    """
+    Build a readable experiment tag for output folders/files.
+
+    Examples:
+        MambaVisionJSCC_small_awgn_C96_snr1-4-7-10-13_snrfilm_enc
+        MambaVisionJSCC_small_awgn_C96_snr10_snrfilm_none
+    """
+    model = _safe_name(getattr(args, "model", "MambaVisionJSCC"))
+    size = _safe_name(getattr(args, "model_size", "small"))
+    channel = _safe_name(getattr(args, "channel_type", "awgn"))
+    c = _safe_name(getattr(args, "C", "unknownC"))
+    snr = _safe_name(getattr(args, "multiple_snr", "unknownSNR"))
+
+    use_snr_film = bool(getattr(args, "use_snr_film", False))
+    pos = str(getattr(args, "snr_film_position", "none"))
+
+    if not use_snr_film or pos == "none":
+        film_tag = "snrfilm_none"
+    else:
+        film_tag = f"snrfilm_{_safe_name(pos)}"
+
+    return f"{model}_{size}_{channel}_C{c}_snr{snr}_{film_tag}"
+
+
 def _format_bytes(num_bytes: int) -> str:
     b = float(num_bytes)
     for unit in ("B", "KB", "MB", "GB", "TB"):
@@ -635,7 +691,7 @@ def _profile_model_and_save(
     buffer_bytes = sum(int(b.numel() * b.element_size()) for b in model.buffers())
 
     batch = max(1, int(getattr(args, "profile_batch", 1)))
-    _, c, h, w = config.image_dims
+    c, h, w = config.image_dims
     x = torch.randn(batch, c, h, w, device=config.device)
 
     flops_total = None
@@ -774,7 +830,7 @@ class Config:
     """
 
     def __init__(self):
-        self.seed = 42
+        self.seed = int(getattr(args, "seed", 42))
         self.pass_channel = True
         self.pretrain_no_channel_epochs = max(0, int(getattr(args, "pretrain_no_channel_epochs", 0)))
         self.CUDA = True
@@ -813,17 +869,22 @@ class Config:
         self.dec_refine_ch = max(8, int(getattr(args, "dec_refine_ch", 32)))
         self.dec_refine_depth = max(1, int(getattr(args, "dec_refine_depth", 2)))
         self.dec_refine_scale = float(getattr(args, "dec_refine_scale", 0.1))
-        self.use_snr_film = args.use_snr_film
-        self.snr_film_hidden = args.snr_film_hidden
-        self.snr_film_scale = args.snr_film_scale
-        self.snr_film_position = args.snr_film_position
+        self.use_snr_film = bool(getattr(args, "use_snr_film", False))
+        self.snr_film_hidden = int(getattr(args, "snr_film_hidden", 64))
+        self.snr_film_scale = float(getattr(args, "snr_film_scale", 0.1))
+        self.use_dec_latent_refiner = bool(getattr(args, "use_dec_latent_refiner", False))
+        self.dec_latent_refiner_hidden = int(getattr(args, "dec_latent_refiner_hidden", 128))
+        self.dec_latent_refiner_scale = float(getattr(args, "dec_latent_refiner_scale", 0.1))
+        self.snr_film_position = str(getattr(args, "snr_film_position", "none"))
 
         # logger / 路径
         self.print_step = 100
         self.plot_step = 10000
-        self.filename = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+        self.run_tag = _build_run_tag(args)
+        self.timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+        self.filename = f"{self.timestamp}_{self.run_tag}"
         # save everything under output_dir, and save checkpoints directly under it (.pth)
-        self.workdir = os.path.abspath(args.output_dir)
+        self.workdir = os.path.abspath(os.path.join(args.output_dir, self.run_tag))
         self.log = _unique_path(os.path.join(self.workdir, f"Log_{self.filename}.log"))
         self.samples = os.path.join(self.workdir, "samples")
         self.models = self.workdir
@@ -1593,7 +1654,7 @@ def test(
 
     # write curve-friendly csv: one row per (snr, rate)
     if curve_path is None:
-        curve_path = os.path.join(config.output_test, "test_curve.csv")
+        curve_path = os.path.join(config.output_test, f"test_curve_{config.run_tag}.csv")
     curve_path = _unique_path(curve_path)
     header = ["snr", "rate", "loss", "psnr", "msssim"]
     if bool(getattr(args, "log_cbr", True)):
@@ -1728,7 +1789,7 @@ def main():
         )
 
     epoch_metrics_path = _unique_path(
-        os.path.join(config.output_train, "epoch_metrics.csv")
+        os.path.join(config.output_train, f"epoch_metrics_{config.run_tag}.csv")
     )
     epoch_header = ["epoch", "split", "loss", "psnr", "msssim", "snr"]
     if bool(getattr(args, "log_cbr", True)):
@@ -1798,7 +1859,9 @@ def main():
             )
 
         # training finished: run one final test on Kodak24
-        test_curve_path = _unique_path(os.path.join(config.output_test, "test_curve.csv"))
+        test_curve_path = _unique_path(
+            os.path.join(config.output_test, f"test_curve_{config.run_tag}.csv")
+        )
         if torch.cuda.is_available() and bool(getattr(args, "empty_cache_before_test", False)):
             torch.cuda.empty_cache()
         # Call on all ranks: `test()` internally runs only on rank0 and uses barriers
@@ -1812,7 +1875,9 @@ def main():
             curve_path=test_curve_path,
         )
     else:
-        test_curve_path = _unique_path(os.path.join(config.output_test, "test_curve.csv"))
+        test_curve_path = _unique_path(
+            os.path.join(config.output_test, f"test_curve_{config.run_tag}.csv")
+        )
         if torch.cuda.is_available() and bool(getattr(args, "empty_cache_before_test", False)):
             torch.cuda.empty_cache()
         test(

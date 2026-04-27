@@ -8,7 +8,7 @@ from loss.distortion import Distortion
 from net.channel import Channel
 from net.decoder import create_mamba_decoder
 from net.encoder import create_mamba_encoder
-from net.snr_film import SNRFiLM
+from net.snr_film import SNRFiLM, SNRLatentRefiner
 
 
 class MambaVisionJSCC(nn.Module):
@@ -73,7 +73,10 @@ class MambaVisionJSCC(nn.Module):
         self.channel_number = int(str(args.C).split(",")[0])
         self.downsample = config.downsample
         self.snr_film_position = str(getattr(config, "snr_film_position", "none"))
-        self.use_snr_film = self.snr_film_position != "none"
+        self.use_snr_film = (
+            bool(getattr(config, "use_snr_film", False))
+            and self.snr_film_position != "none"
+        )
 
         snr_min = float(min(self.multiple_snr))
         snr_max = float(max(self.multiple_snr))
@@ -100,6 +103,21 @@ class MambaVisionJSCC(nn.Module):
         else:
             self.enc_snr_film = None
             self.dec_snr_film = None
+
+        self.use_dec_latent_refiner = bool(
+            getattr(config, "use_dec_latent_refiner", False)
+        )
+
+        if self.use_dec_latent_refiner:
+            self.dec_latent_refiner = SNRLatentRefiner(
+                dim=self.channel_number,
+                hidden_dim=int(getattr(config, "dec_latent_refiner_hidden", 128)),
+                snr_min=snr_min,
+                snr_max=snr_max,
+                scale=float(getattr(config, "dec_latent_refiner_scale", 0.1)),
+            )
+        else:
+            self.dec_latent_refiner = None
 
     def feature_pass_channel(self, feature, chan_param, avg_pwr=False):
         return self.channel(feature, chan_param, avg_pwr)
@@ -139,19 +157,20 @@ class MambaVisionJSCC(nn.Module):
             )
 
         feature = self.encoder(input_pad)
-
-        if self.snr_film_position in ["enc", "both"]:
+        # 发送端调制：让 encoder 输出的通信 latent 感知当前 SNR
+        if self.use_snr_film and self.snr_film_position in ["enc", "both"]:
             feature = self.enc_snr_film(feature, chan_param)
-
         cbr = feature.numel() / 2 / input_image.numel()
         noisy_feature = (
             self.feature_pass_channel(feature, chan_param)
             if bool(getattr(self.config, "pass_channel", True))
             else feature
         )
-
-        if self.snr_film_position in ["dec", "both"]:
+        # 接收端调制：让 decoder 输入前的 noisy latent 感知当前 SNR
+        if self.use_snr_film and self.snr_film_position in ["dec", "both"]:
             noisy_feature = self.dec_snr_film(noisy_feature, chan_param)
+        if self.use_dec_latent_refiner:
+            noisy_feature = self.dec_latent_refiner(noisy_feature, chan_param)
 
         recon_image = self.decoder(noisy_feature)
         if pad_h > 0 or pad_w > 0:
